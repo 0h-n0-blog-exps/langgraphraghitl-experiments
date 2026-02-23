@@ -1,0 +1,123 @@
+# [DEBUG] ============================================================
+# Agent   : architect
+# Task    : Terraform + Docker + docker-compose 設定
+# Created : 2026-02-23T18:56:02
+# Updated : 2026-02-23T19:04:00
+# [/DEBUG] ===========================================================
+#
+# GPU 有構成 (HAS_GPU=true, DOCKER_NVIDIA=true)
+# サービス構成: ollama → ollama-init → backend → frontend
+#
+# 起動順序:
+# 1. ollama: Ollama API サーバー起動 (GPU 使用)
+# 2. ollama-init: llama3.2 モデルの pull（完了後に終了）
+# 3. backend: FastAPI サーバー起動（ollama-init 完了後）
+# 4. frontend: Next.js サーバー起動（backend ヘルスチェック通過後）
+#
+# 注意: pull_policy: never は Docker Compose v2.22+ 必須 (現在: v5.0.2 で対応済み)
+
+services:
+  # --------------------------------------------------------------------------
+  # Ollama: ローカル LLM サーバー (GPU 使用)
+  # タグ固定: 0.5.13 ("latest" 禁止)
+  # --------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:0.5.13
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # ollama/ollama:0.5.13 には curl がない。ollama list コマンドで疎通確認。
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # Ollama Init: モデル pull ワンショットコンテナ
+  # ollama が healthy になってから llama3.2 を pull して終了
+  # タグ固定: 8.11.1 ("latest" 禁止)
+  # --------------------------------------------------------------------------
+  ollama-init:
+    image: curlimages/curl:8.11.1
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    # シェルリスト形式: $OLLAMA_MODEL は env_file の値を参照（デフォルト: llama3.2）
+    command:
+      - sh
+      - -c
+      - |
+        echo '[ollama-init] モデル pull 開始' &&
+        curl -sf -X POST http://ollama:11434/api/pull \
+          -H 'Content-Type: application/json' \
+          -d "{\"name\":\"${OLLAMA_MODEL:-llama3.2}\"}" &&
+        echo '[ollama-init] モデル pull 完了'
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # Backend: FastAPI サーバー (GPU ステージ使用)
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      target: gpu          # GPU ステージ: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+    ports:
+      - "9000:9000"
+    pull_policy: never     # Docker Compose v2.22+ 必須
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # Frontend: Next.js サーバー
+  # context: ./frontend は STEP C で frontend_dev が作成する
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    pull_policy: never     # Docker Compose v2.22+ 必須
+    env_file:
+      - .env
+    environment:
+      - API_URL=http://backend:9000
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  ollama_data:
